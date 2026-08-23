@@ -4,7 +4,7 @@
 import { createProactiveStore, BACKEND_FIRE_COOLDOWN_MS, BACKEND_FAIL_COOLDOWN_MS, PROACTIVE_WINDOW_CAP } from '../store/proactiveStore.js';
 import { createOutboxStore } from '../store/outboxStore.js';
 import { createSubStore } from '../store/subStore.js';
-import { shouldFire, shouldFireInterval } from './impulseEngine.js';
+import { shouldFire, shouldFireInterval, resolveLocalHour } from './impulseEngine.js';
 import { runGeneration } from '../ai/aiCaller.js';
 import { dispatchPush } from '../push/pushSender.js';
 import { nowMs, extractPushBodies } from '../util/ids.js';
@@ -34,6 +34,17 @@ function fillTemplate(template, { transcript, reason, memory }) {
 //   （每个最长 180s）必然超时被杀 → 排后面的 pair 永不触发。给一个保守预算，超了就停，
 //   靠轮转游标下轮接着处理（pairsCursor）。Cloudflare 免费版 CPU 上限较紧，取 25s。
 const TICK_WALL_BUDGET_MS = 25_000;
+
+// 🔕 inbox 级全局节流：同一台手机（inbox）两条主动消息之间至少隔这么久。
+//    没有它时冷却只按 pair 算 → 注册了 10 个角色就可能 10 条几乎同时到，用户体感「被轰炸」。
+const INBOX_MIN_GAP_MS = 25 * 60 * 1000;
+// 复用 pair 级的 lastFired 存储（合成 key），避免改三套 store 实现。
+const INBOX_SLOT_USER = '_';
+const INBOX_SLOT_CHAR = 'inbox';
+
+// 🕰️ 陈旧注册保护：超过这么久没被手机端刷新过（updatedAt）的对，跳过生成。
+//    滑窗/人设/记忆全是一周前的快照，硬生成出来必然「前文不搭」；且多半是用户早已不用的僵尸对。
+const STALE_RECORD_MS = 7 * 24 * 60 * 60 * 1000;
 
 export async function runProactiveTick(env) {
     const proactive = await createProactiveStore(env);
@@ -89,6 +100,12 @@ export async function runProactiveTick(env) {
             // 走线下剧情中：跳过该 inbox 的所有主动生成（用户在前台沉浸剧情，不该被线上消息打断）
             if (await isInboxPaused(rec.inboxId)) continue;
 
+            // 🕰️ 陈旧对：手机端已很久没刷新过它（换机/卸载/关了开关但注销请求丢了）→ 不拿老上下文硬发。
+            if (rec.updatedAt && (now - rec.updatedAt) > STALE_RECORD_MS) {
+                console.warn(`[proactive] 跳过陈旧注册 ${rec.userId}/${rec.charId}（${Math.round((now - rec.updatedAt) / 86400000)} 天未刷新）`);
+                continue;
+            }
+
             // 后端冷却（快照早跳过，省掉后面 verdict/记忆/工具的开销）：用 listEnabled 拍的快照先粗筛。
             //    ⚠️ 这只是早跳过，不是权威判定——快照可能过期（两轮重叠 cron 都拍到旧值），
             //    权威判定在生成前用 claimFireIfStale 做 CAS（见下）。
@@ -100,6 +117,16 @@ export async function runProactiveTick(env) {
                 verdict = shouldFireInterval({
                     now, lastFiredAt: rec.lastFiredAt || 0,
                     interval: rec.interval, intervalUnit: rec.intervalUnit, probability: rec.probability,
+                    // 从未触发过时的基线（防「一注册就开火」）
+                    enabledAt: rec.proactiveEnabledAt || rec.updatedAt || 0,
+                    // 安静时段（与 impulse 档同一份 quietHours；小时按用户/角色时区算，绝不用服务器时区）
+                    quietHours: rec.quietHours || rec.proactiveProfile?.quietHours || null,
+                    hour: resolveLocalHour({
+                        now,
+                        charUtcOffsetSeconds: rec.charUtcOffsetSeconds ?? null,
+                        userUtcOffsetSeconds: (typeof rec.timeSpec?.userUtcOffsetSeconds === 'number')
+                            ? rec.timeSpec.userUtcOffsetSeconds : null,
+                    }),
                 });
             } else {
                 verdict = shouldFire({
@@ -132,6 +159,18 @@ export async function runProactiveTick(env) {
                 rec.inboxId, rec.userId, rec.charId, now, BACKEND_FIRE_COOLDOWN_MS
             );
             if (!claimed) continue; // 别的 tick 刚抢了这一对 → 跳过，绝不双发
+
+            // 🔕 inbox 级全局节流：同一台手机上，不管注册了多少角色，两条主动消息之间至少隔
+            //    INBOX_MIN_GAP_MS。抢不到就本轮不发（pair 槽已抢，下次自然按各自节奏重来）。
+            let prevInboxFire = 0;
+            try { prevInboxFire = await proactive.getLastFired(rec.inboxId, INBOX_SLOT_USER, INBOX_SLOT_CHAR); } catch { prevInboxFire = 0; }
+            let inboxClaimed = true;
+            try {
+                inboxClaimed = await proactive.claimFireIfStale(
+                    rec.inboxId, INBOX_SLOT_USER, INBOX_SLOT_CHAR, now, INBOX_MIN_GAP_MS
+                );
+            } catch { inboxClaimed = true; /* 老 store 无此能力：不节流，照旧 */ }
+            if (!inboxClaimed) continue;
 
             // 命中 → 实时生成。messages 只有一条 system（手机端拼好的完整 prompt + 填充滑窗）
             let transcript = renderTranscript(rec.recentMessages);
@@ -186,6 +225,9 @@ export async function runProactiveTick(env) {
             if (error) {
                 const failMark = now - (BACKEND_FIRE_COOLDOWN_MS - BACKEND_FAIL_COOLDOWN_MS);
                 await proactive.claimFire(rec.inboxId, rec.userId, rec.charId, failMark);
+                // 生成失败没真发出消息 → 把 inbox 全局节流槽还回去，别白占 25 分钟让别的角色也哑火。
+                //   ⚠️ 传 1 而非 0：各 store 的 claimFire 对 0 走 `now || Date.now()` 会反而写成现在。
+                try { await proactive.claimFire(rec.inboxId, INBOX_SLOT_USER, INBOX_SLOT_CHAR, prevInboxFire || 1); } catch { /* ignore */ }
                 console.warn('[proactive] generation failed, short cooldown 5min:', error);
                 continue;
             }

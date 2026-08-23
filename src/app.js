@@ -436,6 +436,24 @@ export function createApp() {
         return c.json({ ok: true });
     });
 
+    // 📋 列出本 inbox 上所有已注册的主动对（手机端「孤儿对账」用）。
+    //   手机端拿到后与本地「角色后台活动」名单求差集，把不该在的注销掉——清理旧版本
+    //   「聊一句就自动注册」留下的僵尸对（用户报「没开开关的角色也反复发消息」）。
+    app.get('/proactive/list', async (c) => {
+        const inboxId = c.req.query('inboxId');
+        if (!inboxId) return c.json({ error: 'inboxId required' }, 400);
+        const { proactive } = await getStores(c.env);
+        const recs = (proactive?.listByInbox ? await proactive.listByInbox(inboxId) : []) || [];
+        return c.json({
+            ok: true,
+            pairs: recs.map(r => ({
+                userId: String(r.userId), charId: String(r.charId),
+                mode: r.mode, enabled: !!r.enabled,
+                updatedAt: r.updatedAt || 0, lastFiredAt: r.lastFiredAt || 0,
+            })),
+        });
+    });
+
     app.post('/proactive/unregister', async (c) => {
         let body;
         try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }

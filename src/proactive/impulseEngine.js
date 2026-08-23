@@ -31,7 +31,7 @@ const DEFAULT_PROFILE = {
     randomLifeChancePerDay: 3,
 };
 
-function isQuietHour(hour, quietHours) {
+export function isQuietHour(hour, quietHours) {
     if (!Array.isArray(quietHours) || quietHours.length !== 2) return false;
     const [start, end] = quietHours;
     if (start === end) return false;
@@ -61,6 +61,18 @@ function calculateScheduleEffect(actCtx) {
     if (!actCtx) return { multiplier: 1, addBonus: 0, factors, hardSkip: false, reason: 'no schedule' };
     // 后端暂不接收 schedule 快照，走中性分支
     return { multiplier: 1, addBonus: 0, factors, hardSkip: false, reason: 'no schedule (backend)' };
+}
+
+/**
+ * 🕒 算「现在是用户/角色那边几点」。规则同 calculateImpulse 内联版：
+ *   异地角色 → 角色当地；否则用户设备时区；两者皆无才不得已用服务器时区。
+ *   抽出来给 interval 档（普通后台主动）复用安静时段判定。
+ */
+export function resolveLocalHour({ now, charUtcOffsetSeconds = null, userUtcOffsetSeconds = null }) {
+    const charOff = (typeof charUtcOffsetSeconds === 'number') ? charUtcOffsetSeconds : null;
+    const userOff = (typeof userUtcOffsetSeconds === 'number') ? userUtcOffsetSeconds : null;
+    const off = charOff != null ? charOff : userOff;
+    return (off != null) ? new Date(now + off * 1000).getUTCHours() : new Date(now).getHours();
 }
 
 /**
@@ -255,10 +267,23 @@ function intervalToMs(interval, unit) {
  * @param {object} ctx { now, lastFiredAt, interval, intervalUnit, probability }
  * @returns {{fire:boolean, reason:string}}
  */
-export function shouldFireInterval({ now, lastFiredAt = 0, interval = 60, intervalUnit = 'minutes', probability = 'medium' }) {
+export function shouldFireInterval({
+    now, lastFiredAt = 0, interval = 60, intervalUnit = 'minutes', probability = 'medium',
+    enabledAt = 0, quietHours = null, hour = null,
+}) {
     const intervalMs = intervalToMs(interval, intervalUnit);
-    if (lastFiredAt && (now - lastFiredAt) < intervalMs) {
-        return { fire: false, reason: `interval not elapsed (${Math.round((now - lastFiredAt) / 60000)}m < ${Math.round(intervalMs / 60000)}m)` };
+    // ⏱️ 基线：优先上次触发；【从未触发过则用注册时间】。
+    //    旧码 lastFiredAt=0 时直接跳到概率 roll → 注册那一刻（开总开关 / BAM 首轮刷新）就有
+    //    70% 概率立刻开火，多个角色同时注册 = 一开开关就被一串主动消息刷屏（用户报「频率不正常」）。
+    //    改成也要等满一个 interval，与手机端「上次检查后隔 interval 才 roll」语义一致。
+    const base = lastFiredAt || enabledAt || 0;
+    if (base && (now - base) < intervalMs) {
+        return { fire: false, reason: `interval not elapsed (${Math.round((now - base) / 60000)}m < ${Math.round(intervalMs / 60000)}m)` };
+    }
+    // 🌙 安静时段：impulse 档一直有（timeOfDayScore/isQuietHour），interval 档旧码完全没有
+    //    → 半夜照发。补上，与 impulse 档同一份 quietHours。
+    if (hour != null && isQuietHour(hour, quietHours)) {
+        return { fire: false, reason: `quiet hours (h=${hour})` };
     }
     const threshold = PROB_MAP[probability] ?? 0.3;
     const roll = Math.random();
